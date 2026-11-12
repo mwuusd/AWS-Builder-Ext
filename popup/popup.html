@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AWS Auto Registration</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <h1>AWS 自动注册</h1>
+      <p class="subtitle">官方 Builder ID 注册，进入控制台才算成功</p>
+    </header>
+
+    <!-- 状态显示区域 -->
+    <div id="status-section" class="section">
+      <div class="status-indicator">
+        <span id="status-dot" class="dot idle"></span>
+        <span id="status-text">准备就绪</span>
+        <span id="counter" class="counter" style="display: none;"></span>
+      </div>
+      <div id="step-text" class="step-text"></div>
+    </div>
+
+    <!-- 并发会话状态 -->
+    <div id="sessions-section" class="section" style="display: none;">
+      <h2>运行中的会话</h2>
+      <div id="sessions-list" class="sessions-list"></div>
+    </div>
+
+    <!-- 邮箱来源 -->
+    <div id="email-source-section" class="section">
+      <div class="section-header">
+        <h2>注册邮箱</h2>
+      </div>
+      <div class="email-mode-row">
+        <label class="email-mode-option">
+          <input type="radio" name="email-mode" value="gmail" checked>
+          Gmail 别名
+        </label>
+        <label class="email-mode-option">
+          <input type="radio" name="email-mode" value="domain">
+          域名邮箱
+        </label>
+      </div>
+    </div>
+
+    <!-- Gmail 配置区域 -->
+    <div id="gmail-section" class="section gmail-section">
+      <div class="section-header">
+        <h2>邮箱配置</h2>
+      </div>
+      <div class="gmail-config">
+        <div class="gmail-input-row">
+          <input type="email" id="gmail-address" placeholder="输入你的 Gmail 地址" class="gmail-input">
+          <button id="gmail-save-btn" class="btn-small">保存</button>
+        </div>
+        <p class="gmail-hint">自动生成别名变体（+号/点号/大小写），验证码需手动填写</p>
+        <p class="gmail-status" id="gmail-status"></p>
+      </div>
+    </div>
+
+    <!-- 域名邮箱 -->
+    <div id="domain-section" class="section domain-section" style="display: none;">
+      <div class="section-header">
+        <h2>域名</h2>
+      </div>
+      <div class="gmail-config">
+        <div class="gmail-input-row">
+          <input type="text" id="domain-input" placeholder="example.com" class="gmail-input">
+          <button id="domain-add-btn" class="btn-small" type="button">添加</button>
+        </div>
+        <ul id="domain-list" class="domain-list"></ul>
+        <p class="gmail-hint">每次注册随机选一个域名，邮箱名也随机生成</p>
+      </div>
+      <div class="section-header domain-mail-header">
+        <h2>自动收信</h2>
+      </div>
+      <div class="gmail-config">
+        <input type="url" id="mail-server-url" placeholder="http://主机:2099" class="gmail-input">
+        <input type="password" id="mail-api-token" placeholder="API Token" class="gmail-input" autocomplete="off">
+        <div class="gmail-input-row">
+          <button id="mail-save-btn" class="btn-small" type="button">保存收信设置</button>
+        </div>
+        <p class="gmail-hint">收到验证码时请求「服务器/Mail?token=令牌&amp;mail=邮箱」，并自动填入页面</p>
+        <p class="gmail-status" id="domain-status"></p>
+      </div>
+    </div>
+
+    <!-- 设置区域 -->
+    <div id="settings-section" class="section settings-section">
+      <div class="settings-row">
+        <div class="setting-item">
+          <label>注册数量</label>
+          <input type="number" id="loop-count" min="1" max="100" value="1" class="setting-input">
+        </div>
+        <div class="setting-item">
+          <label>并发窗口</label>
+          <input type="number" id="concurrency" min="1" max="3" value="1" class="setting-input">
+        </div>
+      </div>
+      <p class="settings-hint" id="settings-hint">使用 Gmail 别名时，验证码需手动填写，建议并发设为 1</p>
+    </div>
+
+    <!-- 操作按钮区域 -->
+    <div id="action-section" class="section">
+      <button id="start-btn" class="btn btn-primary">开始注册</button>
+      <button id="stop-btn" class="btn btn-danger" style="display: none;">停止</button>
+      <button id="reset-btn" class="btn btn-outline" style="display: none;">重新开始</button>
+    </div>
+
+    <!-- 错误显示 -->
+    <div id="error-section" class="section error-section" style="display: none;">
+      <div class="error-icon">!</div>
+      <div id="error-text" class="error-text"></div>
+    </div>
+
+    <!-- 账号信息区域 -->
+    <div id="account-section" class="section" style="display: none;">
+      <h2>当前账号</h2>
+      <div class="info-grid">
+        <div class="info-item">
+          <label>邮箱</label>
+          <div class="info-value">
+            <span id="email-value">-</span>
+            <button class="copy-btn" data-target="email-value" title="复制">复制</button>
+          </div>
+        </div>
+        <div class="info-item">
+          <label>密码</label>
+          <div class="info-value">
+            <span id="password-value">-</span>
+            <button class="copy-btn" data-target="password-value" title="复制">复制</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 导出结果 -->
+    <div id="history-section" class="section">
+      <div class="section-header">
+        <h2>导出结果</h2>
+        <div class="section-actions">
+          <button id="export-btn" class="btn-small" type="button">导出</button>
+          <button id="clear-btn" class="btn-small btn-small-danger" type="button">清空</button>
+        </div>
+      </div>
+      <div id="history-list" class="history-list">
+        <div class="history-empty">暂无记录</div>
+      </div>
+    </div>
+
+    <!-- 底部信息 -->
+    <footer class="footer">
+      <p>无痕模式需在扩展设置中启用</p>
+    </footer>
+  </div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
