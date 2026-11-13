@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AWS Auto Registration",
-  "version": "1.0.11",
-  "description": "AWS Builder ID 自动注册工具",
+  "version": "1.0.37",
+  "description": "AWS Builder 账号自动注册工具",
   "permissions": [
     "activeTab",
     "scripting",

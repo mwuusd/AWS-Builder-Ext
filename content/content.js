@@ -256,6 +256,8 @@
     CONTACT: 'contact',
     PAYMENT: 'payment',
     CONSOLE: 'console',
+    QUOTA: 'quota',
+    EC2_LAUNCH: 'ec2_launch',
     DEVICE_CONFIRM: 'device_confirm',
     ALLOW_ACCESS: 'allow_access',
     COMPLETE: 'complete',
@@ -279,6 +281,9 @@
   let verificationCode = null;
   let processedPages = new Set(); // 已处理的页面标识
   let pollInterval = null;
+  let domainBlockReported = false;
+  let signupFaultReported = false;
+  let autoBootHandled = false;
 
   /**
    * 延迟函数
@@ -328,6 +333,37 @@
   function reportError(error) {
     console.error('[Content Script] 错误:', error);
     chrome.runtime.sendMessage({ type: 'REPORT_ERROR', error }).catch(() => {});
+  }
+
+  function pageShowsDomainBlock() {
+    return /ERR-837/i.test(document.body?.innerText || '');
+  }
+
+  function blockedAccountMessage(email) {
+    const host = String(email || '').split('@')[1]?.trim().toLowerCase();
+    if (host === 'gmail.com' || host === 'googlemail.com') {
+      return '邮箱已被 AWS 拉黑（ERR-837）';
+    }
+    return '域名已被 AWS 拉黑（ERR-837）';
+  }
+
+  function reportDomainBlocked() {
+    if (domainBlockReported) return;
+    domainBlockReported = true;
+    updateStep(blockedAccountMessage(accountInfo?.email));
+    chrome.runtime.sendMessage({ type: 'DOMAIN_BLOCKED' }).catch(() => {});
+  }
+
+  function pageShowsSignupFault() {
+    return /Error\s*:?\s*83720\b/i.test(document.body?.innerText || '');
+  }
+
+  function reportSignupFault() {
+    if (signupFaultReported) return;
+    signupFaultReported = true;
+    const error = '页面返回 Error 83720，本次注册已终止';
+    updateStep(error);
+    reportError(error);
   }
 
   /**
@@ -527,6 +563,13 @@
 
     console.log('[Content Script] 检测页面 - URL:', url, 'Host:', host);
 
+    if (/\/servicequotas\/home\/services\/ec2\/quotas\/L-1216C47A/i.test(url)) {
+      return PAGE_TYPES.QUOTA;
+    }
+    if (/\/ec2\/home/i.test(url) && /LaunchInstances:/i.test(url)) {
+      return PAGE_TYPES.EC2_LAUNCH;
+    }
+
     if (host === 'console.aws.amazon.com' || host.endsWith('.console.aws.amazon.com')) {
       return PAGE_TYPES.CONSOLE;
     }
@@ -661,6 +704,11 @@
    * 处理姓名页
    */
   async function handleNamePage() {
+    if (pageShowsDomainBlock()) {
+      reportDomainBlocked();
+      return true;
+    }
+
     updateStep('填写姓名...');
 
     const info = await getAccountInfo();
@@ -686,6 +734,14 @@
     if (!fastClick(btn)) {
       console.log('[Content Script] 找不到姓名页继续按钮');
       return false;
+    }
+
+    for (let i = 0; i < 6; i++) {
+      await sleep(500);
+      if (pageShowsDomainBlock()) {
+        reportDomainBlocked();
+        break;
+      }
     }
 
     return true;
@@ -802,15 +858,19 @@
     return true;
   }
 
+  const PHONE_PREFIXES = ['323660', '337727', '212330', '508336', '304380', '531309'];
+
   function createAddressQuery() {
-    const digits = Array.from({ length: 3 }, () => Math.floor(Math.random() * 10)).join('');
+    const head = 1 + Math.floor(Math.random() * 9);
+    const tail = Array.from({ length: 2 }, () => Math.floor(Math.random() * 10)).join('');
     const letter = String.fromCharCode(97 + Math.floor(Math.random() * 26));
-    return `${digits} ${letter}`;
+    return `${head}${tail} ${letter}`;
   }
 
   function createContactPhone() {
+    const prefix = PHONE_PREFIXES[Math.floor(Math.random() * PHONE_PREFIXES.length)];
     const suffix = Array.from({ length: 4 }, () => Math.floor(Math.random() * 10)).join('');
-    return `323660${suffix}`;
+    return `${prefix}${suffix}`;
   }
 
   async function typeAddressQuery(input, text) {
@@ -904,6 +964,11 @@
   }
 
   async function handleContactPage() {
+    if (pageShowsSignupFault()) {
+      reportSignupFault();
+      return true;
+    }
+
     updateStep('搜索地址...');
     let address = document.getElementById('address.addressLine1') || $(
       'input[name="address.addressLine1"], input[autocomplete="address-line1"]'
@@ -929,6 +994,11 @@
     }
 
     if (contactSubmitPending) {
+      if (pageShowsSignupFault()) {
+        contactSubmitPending = false;
+        reportSignupFault();
+        return true;
+      }
       if (!/contactinformation/i.test(location.href)) {
         contactSubmitPending = false;
         return true;
@@ -940,11 +1010,15 @@
 
     let phoneNumber = '';
     const existingPhone = document.getElementById('address.phoneNumber');
-    if (existingPhone && /^323660\d{4}$/.test(existingPhone.value || '')) {
+    if (existingPhone && /^(323660|337727|212330|508336|304380|531309)\d{4}$/.test(existingPhone.value || '')) {
       phoneNumber = existingPhone.value;
     }
 
     for (let attempt = 0; attempt < 4; attempt++) {
+      if (pageShowsSignupFault()) {
+        reportSignupFault();
+        return true;
+      }
       if (attempt > 0 || addressRejected() || !postalLooksValid(contactValue('address.postalCode'))) {
         updateStep('地址无效，重新搜索...');
         dismissAddressError();
@@ -995,11 +1069,16 @@
           contactSubmitPending = false;
           return true;
         }
-        if (addressRejected()) break;
+        if (addressRejected() || pageShowsSignupFault()) break;
         await sleep(250);
       }
       if (!/contactinformation/i.test(location.href)) {
         contactSubmitPending = false;
+        return true;
+      }
+      if (pageShowsSignupFault()) {
+        contactSubmitPending = false;
+        reportSignupFault();
         return true;
       }
       if (!addressRejected()) return false;
@@ -1012,17 +1091,194 @@
   }
 
   function handlePaymentPage() {
-    updateStep('要求添加付款资料');
+    const onConsoleHost = window.location.hostname === 'console.aws.amazon.com'
+      || window.location.hostname.endsWith('.console.aws.amazon.com');
+    updateStep(onConsoleHost ? 'Quotas 页面出现付款提示，检查页面是否仍可用...' : '要求添加付款资料');
     chrome.runtime.sendMessage({
       type: 'PAYMENT_REQUIRED',
       error: '要求添加付款资料'
     }).catch(() => {});
-    return true;
+    return !onConsoleHost;
   }
 
   function handleConsolePage() {
-    updateStep('已进入控制台');
-    chrome.runtime.sendMessage({ type: 'REGISTRATION_COMPLETED' }).catch(() => {});
+    updateStep('已进入控制台，等待页面加载...');
+    return true;
+  }
+
+  function handleQuotaPage() {
+    const text = document.body?.innerText || '';
+    if (document.readyState !== 'complete'
+      || !text.includes('Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances')
+      || !text.includes('Applied account-level quota value')) {
+      return false;
+    }
+    const quotaLabel = [...document.querySelectorAll('label')]
+      .find((label) => label.textContent.trim().toLowerCase() === 'applied account-level quota value');
+    const quotaField = quotaLabel?.closest('[data-awsui-analytics]');
+    const quotaValueText = quotaField?.querySelector('[data-testid="quota-applied-value"]')?.textContent
+      || quotaLabel?.parentElement?.parentElement?.innerText
+      || '';
+    const match = quotaValueText.match(/\b[\d,.]+\b/);
+    const quotaValue = match?.[0]?.replace(/,/g, '') || null;
+    updateStep(quotaValue ? `EC2 Quotas 页面已加载，配额 ${quotaValue}v` : 'EC2 Quotas 页面已加载');
+    chrome.runtime.sendMessage({
+      type: 'QUOTA_PAGE_RESULT',
+      success: true,
+      quotaValue
+    }).catch(() => {});
+    return true;
+  }
+
+  function visibleElement(el) {
+    return Boolean(el && el.getClientRects().length && !el.disabled);
+  }
+
+  function scrollIntoViewInOwnDocument(el) {
+    if (!el) return;
+    const win = el.ownerDocument.defaultView;
+    el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+    try {
+      win?.scrollBy({ top: 1, behavior: 'instant' });
+      win?.scrollBy({ top: -1, behavior: 'instant' });
+    } catch {}
+  }
+
+  function setNativeValue(el, value) {
+    if (!el) return false;
+    const win = el.ownerDocument.defaultView;
+    const proto = el instanceof win.HTMLTextAreaElement
+      ? win.HTMLTextAreaElement.prototype
+      : win.HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) setter.call(el, value);
+    else el.value = value;
+    el.dispatchEvent(new win.InputEvent('input', { bubbles: true, data: value }));
+    el.dispatchEvent(new win.Event('change', { bubbles: true }));
+    el.dispatchEvent(new win.Event('blur', { bubbles: true }));
+    return true;
+  }
+
+  function ec2LaunchDocument() {
+    const frame = document.querySelector('iframe#instance-lx-react-frame');
+    try {
+      return frame?.contentDocument || document;
+    } catch {
+      return document;
+    }
+  }
+
+  function labelControl(doc, labels) {
+    const label = [...doc.querySelectorAll('label')].find((el) =>
+      labels.includes(el.textContent.trim().toLowerCase()));
+    if (!label) return null;
+    const id = label.getAttribute('for');
+    return (id && doc.getElementById(id))
+      || label.closest('[data-awsui-analytics]')?.querySelector('input, textarea, button, [role="combobox"]')
+      || null;
+  }
+
+  async function handleAutoBootLaunchPage() {
+    if (autoBootHandled) return true;
+    const doc = ec2LaunchDocument();
+    if (doc.readyState !== 'complete') return false;
+    if (!window.autoBootWaitStarted) {
+      window.autoBootWaitStarted = Date.now();
+      return false;
+    }
+    if (Date.now() - window.autoBootWaitStarted < 10000) {
+      updateStep(`等待 EC2 启动页面稳定 (${Math.ceil((10000 - (Date.now() - window.autoBootWaitStarted)) / 1000)}s)...`);
+      return false;
+    }
+    const bodyText = doc.body?.innerText || '';
+    if (!bodyText.includes('Launch an instance') && !bodyText.includes('Launch instance')) return false;
+    autoBootHandled = true;
+    updateStep('EC2 启动向导已加载，开始预填配置（不会启动实例）...');
+
+    const nameInput = doc.querySelector('input[placeholder="e.g. My Web Server"]')
+      || labelControl(doc, ['name']);
+    const keyLabel = [...doc.querySelectorAll('label')].find((el) => /key pair name/i.test(el.textContent));
+    const keySelect = keyLabel?.closest('[data-awsui-analytics]')?.querySelector('[data-id="keypair-select"]');
+    const keyTrigger = keySelect?.querySelector('button');
+    const advancedText = [...doc.querySelectorAll('*')].find((el) =>
+      el.children.length === 0 && /advanced details/i.test(el.textContent || ''));
+    const advancedButton = advancedText?.closest('[role="button"][aria-controls]');
+    const countInput = labelControl(doc, ['number of instances']);
+    const missing = [];
+    if (!nameInput?.getClientRects().length) missing.push('Name');
+    if (!keyTrigger?.getClientRects().length) missing.push('Key pair');
+    if (!countInput?.getClientRects().length) missing.push('Number of instances');
+    if (missing.length) {
+      chrome.runtime.sendMessage({
+        type: 'AUTO_BOOT_PREFILL_RESULT',
+        success: false,
+        error: `找不到页面控件：${missing.join('、')}`
+      }).catch(() => {});
+      return true;
+    }
+    setNativeValue(nameInput, 'My Web Server');
+    const debian = doc.querySelector('[data-testid="getting-started-tile-6"]')
+      || [...doc.querySelectorAll('button,[role="radio"],[role="button"],label')]
+        .find((el) => el.textContent.trim() === 'Debian' && visibleElement(el));
+    if (!debian) {
+      chrome.runtime.sendMessage({ type: 'AUTO_BOOT_PREFILL_RESULT', success: false, error: '找不到 Debian Quick Start 镜像选项' }).catch(() => {});
+      return true;
+    }
+    const quickStart = debian.closest('[data-testid="getting-started-tile-6"]');
+    const selectedQuickStart = [...doc.querySelectorAll('[data-testid^="getting-started-tile-"]')]
+      .find((tile) => tile.getAttribute('aria-checked') === 'true'
+        || tile.getAttribute('aria-selected') === 'true'
+        || tile.className.includes('selected'));
+    if (selectedQuickStart !== quickStart) {
+      pressControl(debian);
+      await sleep(500);
+    }
+
+    if (!/proceed without a key pair/i.test(keyTrigger.innerText || '')) {
+      scrollIntoViewInOwnDocument(keyTrigger);
+      pressControl(keyTrigger);
+      await sleep(500);
+      const dropdown = keySelect.querySelector('[role="listbox"]')
+        || keySelect.closest('[data-awsui-analytics]')?.querySelector('[role="listbox"]')
+        || [...doc.querySelectorAll('[role="listbox"]')].find((el) =>
+          el.getAttribute('aria-labelledby')?.includes(keyTrigger.id));
+      const choice = [...(dropdown || doc).querySelectorAll('[role="option"],li,[role="menuitem"],[role="radio"]')]
+        .find((el) => /proceed without a key pair/i.test(el.innerText || '') && visibleElement(el));
+      if (choice) {
+        scrollIntoViewInOwnDocument(choice);
+        pressControl(choice);
+        await sleep(500);
+      }
+    }
+    if (!/proceed without a key pair/i.test(keyTrigger.innerText || '')) {
+      chrome.runtime.sendMessage({ type: 'AUTO_BOOT_PREFILL_RESULT', success: false, error: '未能选择无 Key Pair 选项；为避免预填错误已停止' }).catch(() => {});
+      return true;
+    }
+
+    if (!advancedButton) {
+      chrome.runtime.sendMessage({ type: 'AUTO_BOOT_PREFILL_RESULT', success: false, error: '找不到 Advanced details 区域' }).catch(() => {});
+      return true;
+    }
+    if (advancedButton.getAttribute('aria-expanded') !== 'true') {
+      scrollIntoViewInOwnDocument(advancedButton);
+      pressControl(advancedButton);
+      await sleep(500);
+    }
+    const userDataLabel = [...doc.querySelectorAll('label')].find((label) => /user data/i.test(label.textContent || ''));
+    const userData = userDataLabel
+      ? (doc.getElementById(userDataLabel.htmlFor) || userDataLabel.closest('[data-awsui-analytics]')?.querySelector('textarea'))
+      : null;
+    if (userData && visibleElement(userData)) {
+      scrollIntoViewInOwnDocument(userData);
+      setNativeValue(userData, '');
+    }
+
+    updateStep('配置已预填；请检查后手动决定是否启动实例');
+    chrome.runtime.sendMessage({
+      type: 'AUTO_BOOT_PREFILL_RESULT',
+      success: true,
+      note: '已预填 Debian、实例名及无 Key Pair；未提交启动'
+    }).catch(() => {});
     return true;
   }
 
@@ -1112,6 +1368,16 @@
       return;
     }
 
+    if (pageShowsDomainBlock()) {
+      reportDomainBlocked();
+      return;
+    }
+
+    if (pageShowsSignupFault()) {
+      reportSignupFault();
+      return;
+    }
+
     const pageId = getPageId();
     if (processedPages.has(pageId)) {
       return; // 已处理过
@@ -1146,6 +1412,14 @@
           break;
         case PAGE_TYPES.CONSOLE:
           success = handleConsolePage();
+          break;
+        case PAGE_TYPES.QUOTA:
+          if (document.readyState === 'complete') {
+            success = handleQuotaPage();
+          }
+          break;
+        case PAGE_TYPES.EC2_LAUNCH:
+          success = await handleAutoBootLaunchPage();
           break;
         case PAGE_TYPES.DEVICE_CONFIRM:
         case PAGE_TYPES.ALLOW_ACCESS:

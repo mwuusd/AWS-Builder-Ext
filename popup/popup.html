@@ -10,7 +10,7 @@
   <div class="container">
     <header class="header">
       <h1>AWS 自动注册</h1>
-      <p class="subtitle">官方 Builder ID 注册，进入控制台才算成功</p>
+      <p class="subtitle">AWS Builder 账号注册，进入控制台才算成功</p>
     </header>
 
     <!-- 状态显示区域 -->
@@ -56,8 +56,21 @@
           <input type="email" id="gmail-address" placeholder="输入你的 Gmail 地址" class="gmail-input">
           <button id="gmail-save-btn" class="btn-small">保存</button>
         </div>
-        <p class="gmail-hint">自动生成别名变体（+号/点号/大小写），验证码需手动填写</p>
+        <p class="gmail-hint" id="gmail-hint">自动生成别名变体（+号/点号/大小写），验证码需手动填写</p>
         <p class="gmail-status" id="gmail-status"></p>
+        <label class="email-mode-option gmail-forward-toggle">
+          <input type="checkbox" id="gmail-forward-enabled">
+          设置转发自动收信
+        </label>
+        <div id="gmail-forward-settings" class="gmail-forward-settings" style="display: none;">
+          <input type="email" id="gmail-forward-address" class="gmail-input" placeholder="转发邮箱地址" autocomplete="off">
+          <input type="url" id="gmail-forward-server" placeholder="http://主机:2099" class="gmail-input">
+          <input type="password" id="gmail-forward-token" placeholder="API Token" class="gmail-input" autocomplete="off">
+          <div class="gmail-input-row">
+            <button id="gmail-forward-save" class="btn-small" type="button">保存收信设置</button>
+          </div>
+          <p class="gmail-status" id="gmail-forward-status"></p>
+        </div>
       </div>
     </div>
 
@@ -72,7 +85,7 @@
           <button id="domain-add-btn" class="btn-small" type="button">添加</button>
         </div>
         <ul id="domain-list" class="domain-list"></ul>
-        <p class="gmail-hint">每次注册随机选一个域名，邮箱名也随机生成</p>
+        <p class="gmail-hint">每次注册从可用域名里随机选一个，邮箱名也随机生成。标成 AWS已拉黑 的域名会保留，但不会使用</p>
       </div>
       <div class="section-header domain-mail-header">
         <h2>自动收信</h2>
@@ -100,6 +113,10 @@
           <input type="number" id="concurrency" min="1" max="3" value="1" class="setting-input">
         </div>
       </div>
+      <label class="auto-boot-option">
+        <input type="checkbox" id="auto-boot-enabled">
+        注册成功后自动配置 EC2 开机（仅预填，不会启动实例）
+      </label>
       <p class="settings-hint" id="settings-hint">使用 Gmail 别名时，验证码需手动填写，建议并发设为 1</p>
     </div>
 

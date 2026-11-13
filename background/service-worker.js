@@ -4,10 +4,9 @@
  */
 
 import { GmailAliasClient } from '../lib/mail-api.js';
-import { generateDomainEmail, fetchDomainVerificationCode } from '../lib/domain-mail.js';
-import { validateToken, refreshAndValidateToken } from '../lib/oidc-api.js';
+import { generateDomainEmail, fetchDomainVerificationCode, fetchReadyAccountMail, verificationLookupEmail } from '../lib/domain-mail.js';
 import { generatePassword, generateName, generateEmailPrefix } from '../lib/utils.js';
-import { BUILDER_SIGNUP_URL, isConsoleUrl } from '../lib/signup-page.js';
+import { BUILDER_SIGNUP_URL, EC2_QUOTA_URL, isConsoleUrl, planAfterDomainBlock, markDomainBlocked } from '../lib/signup-page.js';
 
 // 邮箱配置。域名模式在每次注册时随机选域名并生成邮箱名。
 let gmailBaseAddress = '';
@@ -15,7 +14,11 @@ let registrationConfig = {
   mode: 'gmail',
   domains: [],
   mailServerUrl: '',
-  mailApiToken: ''
+  mailApiToken: '',
+  gmailForwardEnabled: false,
+  gmailForwardAddress: '',
+  gmailForwardServerUrl: '',
+  gmailForwardApiToken: ''
 };
 
 // ============== 全局状态 ==============
@@ -40,6 +43,7 @@ let sessionIdCounter = 0;
 let taskQueue = [];
 let isRunning = false;
 let shouldStop = false;
+let stopReason = '';
 
 // 注册历史记录
 let registrationHistory = [];
@@ -52,6 +56,10 @@ const historyReady = chrome.storage.local.get(['registrationHistory']).then((sto
 
 const BATCH_ALARM = 'registration-batch-watch';
 const SIGNUP_TIMEOUT_MS = 600000;
+const READY_MAIL_MAX_CHECKS = 1;
+const READY_MAIL_NOTE = '未收到Ready邮件';
+const CONSOLE_LOAD_FALLBACK_MS = 30000;
+const CONSOLE_COUNTDOWN_TICK_MS = 1000;
 let batchJob = null;
 let resumingBatch = false;
 
@@ -61,7 +69,11 @@ function rememberBatchConfig() {
     domains: registrationConfig.domains,
     mailServerUrl: registrationConfig.mailServerUrl,
     mailApiToken: registrationConfig.mailApiToken,
-    gmailAddress: gmailBaseAddress
+    gmailAddress: gmailBaseAddress,
+    gmailForwardEnabled: registrationConfig.gmailForwardEnabled,
+    gmailForwardAddress: registrationConfig.gmailForwardAddress,
+    gmailForwardServerUrl: registrationConfig.gmailForwardServerUrl,
+    gmailForwardApiToken: registrationConfig.gmailForwardApiToken
   };
 }
 
@@ -75,6 +87,84 @@ async function persistBatchJob() {
 
 function watchBatch() {
   chrome.alarms.create(BATCH_ALARM, { periodInMinutes: 1 });
+}
+
+async function rememberSessionWindow(session) {
+  if (!batchJob?.active || !batchJob.inFlight || !session) return;
+  if (batchJob.inFlight.email !== session.email) return;
+  batchJob.inFlight.windowId = session.windowId || null;
+  batchJob.inFlight.consoleWindowId = session.consoleWindowId || null;
+  await persistBatchJob();
+}
+
+async function windowHasConsole(windowId) {
+  if (!windowId) return false;
+  try {
+    const tabs = await chrome.tabs.query({ windowId });
+    return tabs.some((tab) => isConsoleUrl(tab.url || tab.pendingUrl || ''));
+  } catch {
+    return false;
+  }
+}
+
+async function findWindowTab(windowId) {
+  if (!windowId) return null;
+  try {
+    const tabs = await chrome.tabs.query({ windowId });
+    return tabs.find((tab) => tab.active) || tabs[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function navigateToQuotaPage(session) {
+  if (!session || session.signupResult || session.quotaNavigationStarted) return;
+  // Set this before awaiting tab lookup so parallel triggers cannot navigate twice.
+  session.quotaNavigationStarted = true;
+  const tab = await findWindowTab(session.consoleWindowId || session.windowId);
+  if (!tab?.id) {
+    session.quotaNavigationStarted = false;
+    finishSession(session, { success: false, error: '进入控制台后找不到浏览器标签页' });
+    return;
+  }
+  session.quotaTabId = tab.id;
+  updateSession(session.id, { step: '打开 EC2 Quotas 页面...' });
+  try {
+    const quotaNavigation = chrome.tabs.update(tab.id, { url: EC2_QUOTA_URL });
+    // Ready-mail lookup is informational only and is deliberately decoupled
+    // from navigation and registration success/failure.
+    session.readyMailChecks = 1;
+    session.readyMailCheckPromise = sessionHasReadyMail(session)
+      .then((received) => { session.readyMailReceived = Boolean(received); })
+      .catch((error) => {
+        console.warn(`[Session ${session.id}] Ready 邮件检查失败:`, error.message);
+        session.readyMailReceived = false;
+      });
+    await quotaNavigation;
+  } catch (error) {
+    finishSession(session, { success: false, error: `无法打开 EC2 Quotas 页面: ${error.message}` });
+  }
+}
+
+async function closeWindow(windowId) {
+  if (!windowId) return;
+  try {
+    await chrome.windows.remove(windowId);
+  } catch {
+    // 窗口可能已经关闭
+  }
+}
+
+async function closeSessionWindows(session) {
+  const ids = [...new Set([session?.windowId, session?.consoleWindowId].filter(Boolean))];
+  for (const id of ids) {
+    await closeWindow(id);
+  }
+  if (session) {
+    session.windowId = null;
+    session.consoleWindowId = null;
+    session.tabId = null;
+  }
 }
 
 async function clearBatchJob() {
@@ -111,7 +201,7 @@ async function skipUnstartedAttempt() {
   await persistBatchJob();
 }
 
-function recordInterruptedAttempt(attempt, error) {
+function recordSettledAttempt(attempt, success, error, note = null) {
   registrationHistory.unshift({
     id: Date.now() + Math.random(),
     time: new Date().toLocaleString(),
@@ -119,14 +209,18 @@ function recordInterruptedAttempt(attempt, error) {
     password: attempt.password,
     firstName: attempt.firstName,
     lastName: attempt.lastName,
-    success: false,
-    error,
+    success,
+    error: success ? null : error,
+    note: success ? (note || null) : null,
     token: null,
-    tokenStatus: null
   });
   if (registrationHistory.length > 100) {
     registrationHistory = registrationHistory.slice(0, 100);
   }
+}
+
+function recordInterruptedAttempt(attempt, error) {
+  recordSettledAttempt(attempt, false, error);
 }
 
 function launchWorkers(concurrency) {
@@ -139,7 +233,7 @@ function launchWorkers(concurrency) {
     const stopped = shouldStop;
     globalState.status = stopped ? 'idle' : 'completed';
     globalState.step = stopped
-      ? `已停止，成功 ${globalState.totalRegistered} 个`
+      ? (stopReason || `已停止，成功 ${globalState.totalRegistered} 个`)
       : `完成！成功 ${globalState.totalRegistered}/${globalState.totalTarget} 个`;
     await clearBatchJob();
     broadcastState();
@@ -155,7 +249,9 @@ function failStuckAttempt() {
   if (Date.now() - batchJob.inFlight.startedAt < SIGNUP_TIMEOUT_MS) return;
   for (const session of sessions.values()) {
     if (session.email === batchJob.inFlight.email && !session.signupResult) {
-      finishSession(session, { success: false, error: '注册超时，未进入控制台' });
+      finishSession(session, session.consoleReached
+        ? { success: false, error: '注册超时，未能进入 EC2 Quotas 页面' }
+        : { success: false, error: '注册超时，未进入控制台' });
     }
   }
 }
@@ -241,7 +337,10 @@ function getPublicState() {
       email: s.email,
       error: s.error
     })),
-    history: registrationHistory
+    history: registrationHistory,
+    domains: globalState.domains,
+    blockedDomains: globalState.blockedDomains,
+    domainNotice: globalState.domainNotice
   };
 }
 
@@ -264,6 +363,37 @@ function updateSession(sessionId, updates) {
   }
 }
 
+function publishConsoleCountdown(session) {
+  if (!session?.consoleReached || session.consoleLoadChecked || session.quotaNavigationStarted) return;
+  const remaining = Math.max(0, CONSOLE_LOAD_FALLBACK_MS - (Date.now() - session.consoleReachedAt));
+  const seconds = Math.ceil(remaining / 1000);
+  updateSession(session.id, { step: `已进入控制台，等待 ${seconds} 秒后进入 EC2 Quotas...` });
+}
+
+function startConsoleStabilityWait(session, consoleWindowId, completedUrl) {
+  if (!session || session.signupResult || session.quotaNavigationStarted) return;
+  if (consoleWindowId && consoleWindowId !== session.windowId) {
+    session.consoleWindowId = consoleWindowId;
+    rememberSessionWindow(session);
+  }
+  const url = String(completedUrl || '');
+  if (session.consoleReached && session.consoleStableUrl === url) return;
+
+  session.consoleReached = true;
+  session.consoleReachedAt = Date.now();
+  session.consoleStableUrl = url;
+  session.consoleLoadChecked = false;
+  session.consoleWaitGeneration = (session.consoleWaitGeneration || 0) + 1;
+  const generation = session.consoleWaitGeneration;
+    session.readyMailChecks = 0;
+  session.quotaNavigationScheduled = false;
+  console.log(`[Session ${session.id}] Console 导航加载完成，URL=${url}；重新开始 10 秒稳定等待`);
+  publishConsoleCountdown(session);
+  scheduleQuotaNavigation(session, generation).catch((error) => {
+    console.warn(`[Session ${session.id}] 延迟打开 EC2 Quotas 失败:`, error.message);
+  });
+}
+
 // ============== 会话管理 ==============
 
 /**
@@ -273,7 +403,7 @@ function createSession() {
   const sessionId = generateSessionId();
   const session = {
     id: sessionId,
-    status: 'pending', // pending, running, polling_token, completed, error
+    status: 'pending', // pending, running, completed, error
     step: '等待中...',
     error: null,
     // 账号信息
@@ -284,14 +414,9 @@ function createSession() {
     // 邮箱客户端
     mailClient: null,
     mailAccessKey: null,
-    // OIDC 客户端
-    oidcClient: null,
-    oidcAuth: null,
     // 窗口信息
     windowId: null,
     tabId: null,
-    // Token 结果
-    token: null,
     // 轮询控制
     pollAbort: false
   };
@@ -380,6 +505,7 @@ async function runSessionRegistration(session) {
       session.manualVerification = false;
       session.mailServerUrl = registrationConfig.mailServerUrl;
       session.mailApiToken = registrationConfig.mailApiToken;
+      session.mailLookupEmail = email;
     } else {
       if (!gmailBaseAddress) {
         throw new Error('未配置 Gmail 地址，请在插件设置中配置');
@@ -390,7 +516,17 @@ async function runSessionRegistration(session) {
         prefix: nameSuffix,
         mode: 'auto'
       });
-      session.manualVerification = true;
+      if (registrationConfig.gmailForwardEnabled) {
+        if (!registrationConfig.gmailForwardAddress || !registrationConfig.gmailForwardServerUrl || !registrationConfig.gmailForwardApiToken) {
+          throw new Error('未配置转发收信');
+        }
+        session.manualVerification = false;
+        session.mailServerUrl = registrationConfig.gmailForwardServerUrl;
+        session.mailApiToken = registrationConfig.gmailForwardApiToken;
+        session.mailLookupEmail = registrationConfig.gmailForwardAddress;
+      } else {
+        session.manualVerification = true;
+      }
     }
     session.email = email;
     updateSession(session.id, { email });
@@ -437,6 +573,7 @@ async function runSessionRegistration(session) {
 
       session.windowId = window.id;
       session.tabId = window.tabs[0].id;
+      await rememberSessionWindow(session);
       console.log(`[Session ${session.id}] 无痕窗口创建成功: windowId=${window.id}, tabId=${session.tabId}`);
 
       // 等待页面加载完成
@@ -479,8 +616,10 @@ async function runSessionRegistration(session) {
 
     if (signupResult.success) {
       session.status = 'completed';
-      session.token = null;
-      updateSession(session.id, { step: '已进入控制台' });
+      if (signupResult.note) session.note = signupResult.note;
+      updateSession(session.id, {
+        step: session.note ? `注册成功，${session.note}` : '注册成功'
+      });
       await saveToHistory(session, true);
       globalState.totalRegistered++;
       globalState.lastSuccess = {
@@ -488,7 +627,6 @@ async function runSessionRegistration(session) {
         password: session.password,
         firstName: session.firstName,
         lastName: session.lastName,
-        token: null
       };
       return true;
     }
@@ -507,85 +645,117 @@ async function runSessionRegistration(session) {
 
     return false;
   } finally {
-    // 关闭窗口
-    if (session.windowId) {
-      try {
-        await chrome.windows.remove(session.windowId);
-        session.windowId = null;
-      } catch (e) {
-        // 忽略
-      }
-    }
-
-    // Gmail 别名模式不需要删除邮箱
+    await closeSessionWindows(session);
     session.mailClient = null;
   }
 }
 
 /**
- * 结束一次注册等待。成功只认进入 AWS 控制台。
+ * 结束一次注册等待。进入控制台后还要等到 Ready 邮件，超时则成功并注明未收到。
  */
 function finishSession(session, result) {
   if (!session || session.signupResult) return;
   session.signupResult = result;
   session.pollAbort = true;
+  if (result.note) session.note = result.note;
   if (!result.success) {
     session.error = result.error || '注册未完成';
     updateSession(session.id, { step: '失败: ' + session.error });
   }
 }
 
-function waitForSignupResult(session, timeout = 600000) {
+function canCheckReadyMail(session) {
+  const email = verificationLookupEmail(session?.email, session?.mailLookupEmail);
+  return Boolean(session?.mailServerUrl && session?.mailApiToken && email);
+}
+
+async function sessionHasReadyMail(session) {
+  if (!canCheckReadyMail(session)) return false;
+  const result = await fetchReadyAccountMail({
+    serverUrl: session.mailServerUrl,
+    token: session.mailApiToken,
+    email: verificationLookupEmail(session.email, session.mailLookupEmail)
+  });
+  return Boolean(result.ready);
+}
+
+function markConsoleReached(session, consoleWindowId) {
+  startConsoleStabilityWait(session, consoleWindowId, '');
+}
+
+async function scheduleQuotaNavigation(session, expectedGeneration = session?.consoleWaitGeneration) {
+  if (!session || session.signupResult || session.quotaNavigationStarted
+    || session.quotaNavigationScheduled) return;
+  session.quotaNavigationScheduled = true;
+  while (!session.signupResult && !session.quotaNavigationStarted
+    && expectedGeneration === session.consoleWaitGeneration) {
+    const remaining = CONSOLE_LOAD_FALLBACK_MS - (Date.now() - session.consoleReachedAt);
+    if (remaining <= 0) break;
+    publishConsoleCountdown(session);
+    await new Promise((resolve) => setTimeout(resolve, Math.min(CONSOLE_COUNTDOWN_TICK_MS, remaining)));
+  }
+  if (session.signupResult || session.quotaNavigationStarted
+    || expectedGeneration !== session.consoleWaitGeneration) return;
+  session.consoleLoadChecked = true;
+  updateSession(session.id, { step: `控制台页面已稳定 ${CONSOLE_LOAD_FALLBACK_MS / 1000} 秒，进入 EC2 Quotas...` });
+  await navigateToQuotaPage(session);
+}
+
+function finishQuotaPage(session, result) {
+  if (!session || session.signupResult) return;
+  session.quotaPageResult = result;
+  finalizeQuotaSession(session);
+}
+
+function finalizeQuotaSession(session) {
+  if (!session || session.signupResult || !session.quotaPageResult) return;
+  const result = session.quotaPageResult;
+  if (session.autoBootEnabled && !session.autoBootPrefillResult) return;
+  const ready = session.readyMailReceived ? '收到Ready邮件' : READY_MAIL_NOTE;
+  if (result.success) {
+    session.quotaValue = result.quotaValue || null;
+    const quota = session.quotaValue ? `${session.quotaValue}v` : '';
+    finishSession(session, { success: true, note: `${quota ? `${quota}，` : ''}${ready}` });
+  } else {
+    finishSession(session, { success: false, error: `${result.error || '未能进入 EC2 Quotas 页面'}，${ready}` });
+  }
+}
+
+function waitForSignupResult(session, timeout = SIGNUP_TIMEOUT_MS) {
   return new Promise((resolve) => {
     const start = Date.now();
-    const tick = () => {
+    const tick = async () => {
       if (session.signupResult) {
         resolve(session.signupResult);
         return;
       }
-      if (shouldStop || session.pollAbort) {
+      if (session.consoleReached && !session.signupResult) finalizeQuotaSession(session);
+      if (session.signupResult) {
+        resolve(session.signupResult);
+        return;
+      }
+      if (shouldStop) {
+        finishSession(session, session.consoleReached
+          ? { success: false, error: `注册已中断，${session.readyMailReceived ? '收到Ready邮件' : READY_MAIL_NOTE}` }
+          : { success: false, error: session.error || '已中断' });
+        resolve(session.signupResult);
+        return;
+      }
+      if (session.pollAbort) {
         resolve({ success: false, error: session.error || '已中断' });
         return;
       }
       if (Date.now() - start >= timeout) {
-        const result = { success: false, error: '注册超时，未进入控制台' };
-        finishSession(session, result);
-        resolve(result);
+        finishSession(session, session.consoleReached
+          ? { success: false, error: session.quotaPageResult?.error || '进入 EC2 Quotas 页面超时' }
+          : { success: false, error: '注册超时，未进入控制台' });
+        resolve(session.signupResult);
         return;
       }
-      setTimeout(tick, 400);
+      setTimeout(tick, 1000);
     };
     tick();
   });
-}
-
-/**
- * 轮询获取 Token
- */
-async function pollSessionToken(session) {
-  if (!session.oidcClient) return null;
-
-  const startTime = Date.now();
-  const timeout = 600000; // 10 分钟超时
-  const pollInterval = Math.max(session.oidcClient.interval * 1000, 2000);
-
-  while (!session.pollAbort && !shouldStop && Date.now() - startTime < timeout) {
-    try {
-      const result = await session.oidcClient.getToken();
-      if (result) {
-        console.log(`[Session ${session.id}] Token 获取成功`);
-        return result;
-      }
-    } catch (error) {
-      if (!error.message.includes('authorization_pending')) {
-        console.error(`[Session ${session.id}] Token 轮询错误:`, error);
-      }
-    }
-
-    await new Promise(resolve => setTimeout(resolve, pollInterval));
-  }
-
-  return null;
 }
 
 /**
@@ -594,15 +764,6 @@ async function pollSessionToken(session) {
 async function saveToHistory(session, success) {
   if (session.historySaved) return;
   session.historySaved = true;
-
-  let tokenInfo = null;
-  if (success && session.token) {
-    tokenInfo = {
-      ...session.token,
-      clientId: session.oidcAuth?.clientId || '',
-      clientSecret: session.oidcAuth?.clientSecret || ''
-    };
-  }
 
   const record = {
     id: Date.now() + Math.random(),
@@ -613,8 +774,7 @@ async function saveToHistory(session, success) {
     lastName: session.lastName,
     success: success,
     error: success ? null : session.error,
-    token: tokenInfo,
-    tokenStatus: success ? 'unknown' : null
+    note: success ? (session.note || null) : null,
   };
 
   registrationHistory.unshift(record);
@@ -624,136 +784,6 @@ async function saveToHistory(session, success) {
 
   await markAttemptFinished(success);
   await chrome.storage.local.set({ registrationHistory });
-}
-
-/**
- * 批量验证所有 Token（并发执行，带进度）
- */
-async function validateAllTokens() {
-  const results = {
-    total: 0,
-    valid: 0,
-    expired: 0,
-    suspended: 0,
-    invalid: 0,
-    error: 0,
-    details: []
-  };
-
-  const recordsToValidate = registrationHistory.filter(r => r.success && r.token?.refreshToken);
-  results.total = recordsToValidate.length;
-
-  if (results.total === 0) {
-    return results;
-  }
-
-  // 并发验证（每批 5 个）
-  const concurrency = 5;
-  let validated = 0;
-
-  // 通知开始验证
-  chrome.runtime.sendMessage({
-    type: 'VALIDATION_PROGRESS',
-    progress: { validated: 0, total: results.total }
-  }).catch(() => {});
-
-  for (let i = 0; i < recordsToValidate.length; i += concurrency) {
-    const batch = recordsToValidate.slice(i, i + concurrency);
-
-    // 并发执行当前批次
-    const batchResults = await Promise.allSettled(
-      batch.map(async (record) => {
-        try {
-          // 使用刷新并验证的方法
-          const result = await refreshAndValidateToken({
-            clientId: record.token.clientId,
-            clientSecret: record.token.clientSecret,
-            refreshToken: record.token.refreshToken
-          });
-
-          // 更新记录的 token 状态
-          record.tokenStatus = result.status;
-
-          // 如果刷新成功，更新 token
-          if (result.newAccessToken) {
-            record.token.accessToken = result.newAccessToken;
-            record.token.refreshToken = result.newRefreshToken;
-          }
-
-          return { record, result };
-        } catch (error) {
-          record.tokenStatus = 'error';
-          return { record, result: { status: 'error', error: error.message } };
-        }
-      })
-    );
-
-    // 统计结果
-    for (const promiseResult of batchResults) {
-      if (promiseResult.status === 'fulfilled') {
-        const { result } = promiseResult.value;
-        
-        switch (result.status) {
-          case 'valid':
-            results.valid++;
-            break;
-          case 'suspended':
-            results.suspended++;
-            results.details.push({ 
-              email: promiseResult.value.record.email, 
-              status: 'suspended', 
-              error: result.error 
-            });
-            break;
-          case 'expired':
-            results.expired++;
-            results.details.push({ 
-              email: promiseResult.value.record.email, 
-              status: 'expired', 
-              error: result.error 
-            });
-            break;
-          case 'invalid':
-            results.invalid++;
-            results.details.push({ 
-              email: promiseResult.value.record.email, 
-              status: 'invalid', 
-              error: result.error 
-            });
-            break;
-          case 'error':
-            results.error++;
-            results.details.push({ 
-              email: promiseResult.value.record.email, 
-              status: 'error', 
-              error: result.error 
-            });
-            break;
-        }
-      } else {
-        results.error++;
-      }
-
-      validated++;
-    }
-
-    // 通知进度更新
-    chrome.runtime.sendMessage({
-      type: 'VALIDATION_PROGRESS',
-      progress: { validated, total: results.total }
-    }).catch(() => {});
-
-    // 批次间延迟，避免限流
-    if (i + concurrency < recordsToValidate.length) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-  }
-
-  // 保存更新后的状态
-  chrome.storage.local.set({ registrationHistory });
-  broadcastState();
-
-  return results;
 }
 
 // ============== 批量注册控制 ==============
@@ -767,32 +797,53 @@ async function startBatchRegistration(loopCount, concurrency, options = {}) {
   }
 
   const emailMode = options.emailMode === 'domain' ? 'domain' : 'gmail';
-  const domains = Array.isArray(options.domains) ? options.domains : [];
+  const blocked = new Set((Array.isArray(options.blockedDomains) ? options.blockedDomains : [])
+    .map((item) => String(item).trim().toLowerCase()));
+  const domains = (Array.isArray(options.domains) ? options.domains : [])
+    .map((item) => String(item).trim().toLowerCase())
+    .filter((item) => item && !blocked.has(item));
   const mailServerUrl = options.mailServerUrl || '';
   const mailApiToken = options.mailApiToken || '';
   const gmailAddress = options.gmailAddress || '';
+  const gmailForwardEnabled = Boolean(options.gmailForwardEnabled);
+  const gmailForwardAddress = String(options.gmailForwardAddress || '').trim();
+  const gmailForwardServerUrl = options.gmailForwardServerUrl || '';
+  const gmailForwardApiToken = options.gmailForwardApiToken || '';
 
   if (emailMode === 'domain') {
     if (domains.length === 0) {
-      return { success: false, error: '未配置域名' };
+      return { success: false, error: '没有可用域名' };
     }
     if (!mailServerUrl || !mailApiToken) {
       return { success: false, error: '未配置收信服务器或 API Token' };
     }
   } else if (!gmailAddress) {
     return { success: false, error: '未配置 Gmail 地址' };
+  } else if (gmailForwardEnabled && (!gmailForwardAddress || !gmailForwardServerUrl || !gmailForwardApiToken)) {
+    return { success: false, error: '未配置转发收信' };
   }
 
-  registrationConfig = { mode: emailMode, domains, mailServerUrl, mailApiToken };
+  registrationConfig = {
+    mode: emailMode,
+    domains,
+    mailServerUrl,
+    mailApiToken,
+    gmailForwardEnabled: emailMode === 'gmail' && gmailForwardEnabled,
+    gmailForwardAddress,
+    gmailForwardServerUrl,
+    gmailForwardApiToken
+  };
   gmailBaseAddress = gmailAddress;
 
   isRunning = true;
   shouldStop = false;
+  stopReason = '';
 
   batchJob = {
     active: true,
     loopCount,
     concurrency,
+    autoBootEnabled: Boolean(options.autoBootEnabled),
     ...rememberBatchConfig(),
     remaining: loopCount,
     totalRegistered: 0,
@@ -893,9 +944,74 @@ async function runWorker(workerId) {
 /**
  * 停止注册
  */
+async function blacklistSignupDomain(session) {
+  const pendingTasks = taskQueue.length;
+  const plan = registrationConfig.mode === 'domain'
+    ? planAfterDomainBlock({
+      domains: registrationConfig.domains,
+      email: session.email,
+      pendingTasks
+    })
+    : { blocked: '', domains: registrationConfig.domains, continueBatch: pendingTasks > 0 };
+  const message = registrationConfig.mode === 'domain'
+    ? (plan.blocked
+      ? `域名 ${plan.blocked} 已被 AWS 拉黑（ERR-837）`
+      : '域名已被 AWS 拉黑（ERR-837）')
+    : '邮箱已被 AWS 拉黑（ERR-837）';
+
+  if (plan.blocked) {
+    registrationConfig.domains = plan.domains;
+    if (batchJob) batchJob.domains = plan.domains.slice();
+    if (!plan.continueBatch && pendingTasks > 0) {
+      shouldStop = true;
+      taskQueue = [];
+      stopReason = `域名 ${plan.blocked} 已被 AWS 拉黑，没有其他可用域名，任务已结束`;
+      if (batchJob?.active) batchJob.remaining = 0;
+    }
+  }
+
+  finishSession(session, { success: false, error: message });
+  if (plan.blocked) {
+    for (const other of sessions.values()) {
+      if (other === session || other.signupResult || !other.email) continue;
+      const otherDomain = String(other.email).split('@')[1]?.trim().toLowerCase();
+      if (otherDomain === plan.blocked) {
+        finishSession(other, { success: false, error: message });
+      }
+    }
+  }
+
+  if (!plan.blocked) return;
+
+  const stored = await chrome.storage.local.get(['emailDomains', 'blockedDomains']);
+  const saved = Array.isArray(stored.emailDomains) ? stored.emailDomains : [];
+  const marked = markDomainBlocked({
+    domains: saved,
+    blockedDomains: stored.blockedDomains,
+    domain: plan.blocked
+  });
+  await chrome.storage.local.set({
+    emailDomains: marked.domains,
+    blockedDomains: marked.blockedDomains
+  });
+  if (batchJob?.active) await persistBatchJob();
+
+  globalState.domains = marked.domains;
+  globalState.blockedDomains = marked.blockedDomains;
+  globalState.domainNotice = `已标记 ${plan.blocked} [AWS已拉黑]`;
+  if (stopReason) {
+    updateGlobalState({ error: message, step: stopReason });
+  } else if (plan.continueBatch) {
+    updateGlobalState({ step: `已标记 ${plan.blocked} [AWS已拉黑]，继续下一次注册` });
+  } else {
+    updateGlobalState({ step: `已标记 ${plan.blocked} [AWS已拉黑]` });
+  }
+}
+
 function stopRegistration() {
   console.log('[Service Worker] 停止注册');
   shouldStop = true;
+  stopReason = '';
   taskQueue = [];
   clearBatchJob();
 
@@ -940,7 +1056,7 @@ async function resetState() {
  */
 function findSessionByWindowId(windowId) {
   for (const session of sessions.values()) {
-    if (session.windowId === windowId) {
+    if (session.windowId === windowId || session.consoleWindowId === windowId) {
       return session;
     }
   }
@@ -991,7 +1107,7 @@ async function pollDomainVerificationCode(session) {
     const result = await fetchDomainVerificationCode({
       serverUrl: session.mailServerUrl,
       token: session.mailApiToken,
-      email: session.email
+      email: verificationLookupEmail(session.email, session.mailLookupEmail)
     });
 
     if (result.pending || !result.code) {
@@ -1038,8 +1154,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'START_BATCH_REGISTRATION':
       startBatchRegistration(message.loopCount || 1, message.concurrency || 1, {
         emailMode: message.emailMode,
+        autoBootEnabled: message.autoBootEnabled,
         gmailAddress: message.gmailAddress,
+        gmailForwardEnabled: message.gmailForwardEnabled,
+        gmailForwardAddress: message.gmailForwardAddress,
+        gmailForwardServerUrl: message.gmailForwardServerUrl,
+        gmailForwardApiToken: message.gmailForwardApiToken,
         domains: message.domains,
+        blockedDomains: message.blockedDomains,
         mailServerUrl: message.mailServerUrl,
         mailApiToken: message.mailApiToken
       })
@@ -1103,17 +1225,70 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ success: true });
       break;
 
+    case 'DOMAIN_BLOCKED':
+      if (session) {
+        blacklistSignupDomain(session).then(() => sendResponse({ success: true }));
+        return true;
+      }
+      sendResponse({ success: true });
+      break;
+
     case 'PAYMENT_REQUIRED':
       if (session) {
-        finishSession(session, { success: false, error: message.error || '要求添加付款资料' });
+        (async () => {
+          const senderUrl = sender.tab?.url || sender.tab?.pendingUrl || '';
+          const quotaWindowId = session.consoleWindowId || session.windowId;
+          const currentTab = await findWindowTab(quotaWindowId);
+          const onQuotaFlow = session.quotaNavigationStarted
+            || /\/servicequotas\/home\/services\/ec2\/quotas\/L-1216C47A/i.test(senderUrl)
+            || /\/servicequotas\/home\/services\/ec2\/quotas\/L-1216C47A/i.test(currentTab?.url || '');
+          if (!onQuotaFlow) finishSession(session, { success: false, error: message.error || '要求添加付款资料' });
+          sendResponse({ success: true });
+        })();
+        return true;
       }
       sendResponse({ success: true });
       break;
 
     case 'REGISTRATION_COMPLETED':
+      sendResponse({ success: true });
+      break;
+
+    case 'QUOTA_PAGE_RESULT':
       if (session) {
-        finishSession(session, { success: true });
-        updateSession(session.id, { step: '已进入控制台' });
+        session.quotaValue = message.quotaValue || null;
+        if (session.autoBootEnabled && message.success) {
+          session.quotaPageResult = { success: true, quotaValue: session.quotaValue };
+          chrome.tabs.update(sender.tab.id, {
+            url: 'https://console.aws.amazon.com/ec2/home?region=us-east-2#LaunchInstances:'
+          }).catch((error) => {
+            finishSession(session, { success: false, error: `无法打开 EC2 启动配置页: ${error.message}` });
+          });
+          sendResponse({ success: true });
+          return true;
+        }
+        finishQuotaPage(session, {
+          success: Boolean(message.success),
+          quotaValue: message.quotaValue || null,
+          error: message.error || null
+        });
+      }
+      sendResponse({ success: true });
+      break;
+
+    case 'AUTO_BOOT_PREFILL_RESULT':
+      if (session?.autoBootEnabled) {
+        session.autoBootPrefillResult = {
+          success: Boolean(message.success),
+          note: message.note || null,
+          error: message.error || null
+        };
+        updateSession(session.id, {
+          step: message.success
+            ? '注册成功，EC2 启动配置已预填（未启动）'
+            : `注册成功，EC2 页面预填未完成：${message.error || '必要控件未找到'}`
+        });
+        finalizeQuotaSession(session);
       }
       sendResponse({ success: true });
       break;
@@ -1135,35 +1310,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       historyReady.then(() => sendResponse({ history: registrationHistory }));
       return true;
 
-    case 'VALIDATE_TOKEN':
-      // 验证单个 Token
-      if (message.accessToken) {
-        validateToken(message.accessToken).then(sendResponse);
-        return true;
-      } else {
-        sendResponse({ valid: false, error: '缺少 accessToken' });
-      }
-      break;
-
-    case 'VALIDATE_ALL_TOKENS':
-      // 批量验证所有 Token
-      validateAllTokens().then(sendResponse);
-      return true;
-
-    case 'GET_VALID_HISTORY':
-      // 获取已验证且有效的历史记录（排除 suspended, expired, invalid, error）
-      sendResponse({
-        history: registrationHistory.filter(r =>
-          r.success &&
-          r.token &&
-          r.tokenStatus !== 'suspended' &&
-          r.tokenStatus !== 'expired' &&
-          r.tokenStatus !== 'invalid' &&
-          r.tokenStatus !== 'error'
-        )
-      });
-      break;
-
     default:
       sendResponse({ error: '未知消息类型' });
   }
@@ -1171,30 +1317,87 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // 监听标签页更新（处理窗口内导航时 tabId 更新）
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (!tab.incognito) return;
-  const session = findSessionByWindowId(tab.windowId);
-  if (!session) return;
-  if (session.tabId !== tabId) {
+  const url = changeInfo.url || tab.url || '';
+  const session = tab.windowId ? findSessionByWindowId(tab.windowId) : null;
+  if (session && session.tabId !== tabId) {
     console.log(`[Service Worker] 会话 ${session.id} 标签页更新: ${session.tabId} -> ${tabId}`);
     session.tabId = tabId;
   }
-  const url = changeInfo.url || tab.url || '';
-  if (isConsoleUrl(url)) {
-    console.log(`[Session ${session.id}] 已进入控制台:`, url);
-    finishSession(session, { success: true });
-    updateSession(session.id, { step: '已进入控制台' });
+  const isConsole = isConsoleUrl(url);
+  const isIncompleteSignup = /^https:\/\/signup\.aws\.amazon\.com\/billing\/signup\/incomplete/i.test(url);
+  if (!isConsole && !isIncompleteSignup) return;
+
+  const markConsole = (owner, consoleWindowId) => {
+    markConsoleReached(owner, consoleWindowId);
+  };
+
+  if (session) {
+    if (isIncompleteSignup) {
+      finishSession(session, {
+        success: false,
+        error: `失败，注册未完成（AWS 跳转到 billing/signup/incomplete），${session.readyMailReceived ? '收到Ready邮件' : READY_MAIL_NOTE}`
+      });
+      return;
+    }
+    // URL changes are emitted before the Console document has necessarily
+    // finished loading. Start the stability countdown only on completed load.
+    if (isConsole && !session.quotaNavigationStarted && !session.quotaPageResult) {
+      if (changeInfo.status === 'loading') {
+        session.consoleLoadPending = true;
+        session.consoleStableUrl = null;
+        session.consoleWaitGeneration = (session.consoleWaitGeneration || 0) + 1;
+        session.quotaNavigationScheduled = false;
+        if (session.consoleReached) {
+          session.consoleReachedAt = Date.now();
+          session.consoleLoadChecked = false;
+          publishConsoleCountdown(session);
+        }
+      } else if (changeInfo.status === 'complete') {
+        startConsoleStabilityWait(session, tab.windowId, url);
+      }
+    }
+    if (isConsole) {
+      console.log(`[Session ${session.id}] 检测到 Console 标签页 URL: ${url}；导航状态=${session.quotaNavigationStarted ? 'quota' : 'pre-quota'}`);
+    }
+    if (session.quotaNavigationStarted && changeInfo.status === 'complete') {
+      if (!/\/servicequotas\/home\/services\/ec2\/quotas\/L-1216C47A/i.test(url)) {
+        finishQuotaPage(session, { success: false, error: '进入控制台后跳转到了非 EC2 Quotas 页面' });
+      }
+    }
+    return;
   }
+  if (!isConsole || !tab.openerTabId) return;
+  chrome.tabs.get(tab.openerTabId).then((opener) => {
+    const owner = opener?.windowId ? findSessionByWindowId(opener.windowId) : null;
+    if (!owner?.quotaNavigationStarted && !owner?.quotaPageResult && changeInfo.status === 'loading') {
+      owner.consoleLoadPending = true;
+      owner.consoleStableUrl = null;
+      owner.consoleWaitGeneration = (owner.consoleWaitGeneration || 0) + 1;
+      owner.quotaNavigationScheduled = false;
+      if (owner.consoleReached) {
+        owner.consoleReachedAt = Date.now();
+        owner.consoleLoadChecked = false;
+        publishConsoleCountdown(owner);
+      }
+    } else if (!owner?.quotaNavigationStarted && !owner?.quotaPageResult
+      && changeInfo.status === 'complete') {
+      startConsoleStabilityWait(owner, tab.windowId, url);
+    }
+  }).catch(() => {});
 });
 
 // 监听窗口关闭
 chrome.windows.onRemoved.addListener((windowId) => {
   const session = findSessionByWindowId(windowId);
-  if (session) {
+  if (session && !session.quotaNavigationStarted && !session.quotaPageResult) {
     console.log(`[Service Worker] 会话 ${session.id} 的窗口已关闭`);
-    session.windowId = null;
-    session.tabId = null;
-    if (!session.signupResult) {
-      finishSession(session, { success: false, error: '注册窗口已关闭' });
+    if (session.consoleWindowId === windowId) session.consoleWindowId = null;
+    if (session.windowId === windowId) {
+      session.windowId = null;
+      session.tabId = null;
+    }
+    if (!session.signupResult && (!session.consoleReached || (!session.quotaNavigationStarted && !session.quotaPageResult))) {
+      finishSession(session, { success: false, error: session.consoleReached ? '控制台窗口已关闭，未打开 EC2 Quotas 页面' : '注册窗口已关闭' });
     }
   }
 });
@@ -1216,8 +1419,22 @@ async function resumeBatchIfNeeded() {
 
     batchJob = job;
     if (batchJob.inFlight) {
-      recordInterruptedAttempt(batchJob.inFlight, '注册超时或任务中断');
+      const attempt = batchJob.inFlight;
+      const windowIds = [...new Set([attempt.windowId, attempt.consoleWindowId].filter(Boolean))];
+      let reachedConsole = false;
+      for (const windowId of windowIds) {
+        if (await windowHasConsole(windowId)) reachedConsole = true;
+      }
+      recordInterruptedAttempt(
+        attempt,
+        reachedConsole
+          ? '任务中断，未完成 EC2 Quotas 检查'
+          : '注册超时或任务中断'
+      );
       batchJob.totalFailed += 1;
+      for (const windowId of windowIds) {
+        await closeWindow(windowId);
+      }
       batchJob.inFlight = null;
       await chrome.storage.local.set({ registrationHistory, batchJob });
     }
@@ -1242,7 +1459,11 @@ async function resumeBatchIfNeeded() {
       mode: batchJob.mode === 'domain' ? 'domain' : 'gmail',
       domains: batchJob.domains || [],
       mailServerUrl: batchJob.mailServerUrl || '',
-      mailApiToken: batchJob.mailApiToken || ''
+      mailApiToken: batchJob.mailApiToken || '',
+      gmailForwardEnabled: Boolean(batchJob.gmailForwardEnabled),
+      gmailForwardAddress: batchJob.gmailForwardAddress || '',
+      gmailForwardServerUrl: batchJob.gmailForwardServerUrl || '',
+      gmailForwardApiToken: batchJob.gmailForwardApiToken || ''
     };
     gmailBaseAddress = batchJob.gmailAddress || '';
     shouldStop = false;
