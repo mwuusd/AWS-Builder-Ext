@@ -115,7 +115,7 @@
       </div>
       <label class="auto-boot-option">
         <input type="checkbox" id="auto-boot-enabled">
-        注册成功后自动配置 EC2 开机（仅预填，不会启动实例）
+        注册成功后自动配置并启动 EC2 实例（会真实开机）
       </label>
       <p class="settings-hint" id="settings-hint">使用 Gmail 别名时，验证码需手动填写，建议并发设为 1</p>
     </div>
@@ -123,6 +123,9 @@
     <!-- 操作按钮区域 -->
     <div id="action-section" class="section">
       <button id="start-btn" class="btn btn-primary">开始注册</button>
+      <button id="dev-start-instance-btn" class="btn btn-outline" type="button">startInstance</button>
+      <button id="dev-start-test-btn" class="btn btn-outline" type="button">starttest</button>
+      <button id="dev-stop-test-btn" class="btn btn-danger" type="button" style="display: none;">stoptest</button>
       <button id="stop-btn" class="btn btn-danger" style="display: none;">停止</button>
       <button id="reset-btn" class="btn btn-outline" style="display: none;">重新开始</button>
     </div>

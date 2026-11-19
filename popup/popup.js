@@ -19,6 +19,9 @@ const concurrencyInput = document.getElementById('concurrency');
 const autoBootEnabledInput = document.getElementById('auto-boot-enabled');
 
 const startBtn = document.getElementById('start-btn');
+const devStartInstanceBtn = document.getElementById('dev-start-instance-btn');
+const devStartTestBtn = document.getElementById('dev-start-test-btn');
+const devStopTestBtn = document.getElementById('dev-stop-test-btn');
 const stopBtn = document.getElementById('stop-btn');
 const resetBtn = document.getElementById('reset-btn');
 
@@ -367,6 +370,87 @@ async function startRegistration() {
   } finally {
     startBtn.disabled = false;
   }
+}
+
+async function startDevInstanceWindow() {
+  devStartInstanceBtn.disabled = true;
+  try {
+    const existing = await chrome.storage.local.get('devAutoBootTestWindowId');
+    if (existing.devAutoBootTestWindowId) {
+      try {
+        await chrome.windows.get(existing.devAutoBootTestWindowId);
+        const confirmClose = window.confirm('发现上一次开发测试窗口仍打开。关闭旧窗口并新开一个吗？');
+        if (!confirmClose) return;
+        await chrome.windows.remove(existing.devAutoBootTestWindowId);
+      } catch {
+        // Previous test window was already closed.
+      }
+    }
+    const response = await chrome.runtime.sendMessage({ type: 'DEV_START_EC2_AUTO_BOOT_WINDOW' });
+    if (!response?.success) alert(response?.error || '开发测试窗口启动失败');
+    else {
+      await chrome.storage.local.set({ devAutoBootTestWindowId: response.windowId });
+      await chrome.storage.local.remove('devAutoBootTestPrefillStarted');
+      updateDevTestButtons({ prefillStarted: false });
+      alert('无痕窗口已打开。请手动登录 AWS 并进入 EC2 Quotas 页面，然后点击 starttest。之后保持该窗口不关，即可反复测试无需重新登录。');
+    }
+  } catch (error) {
+    alert(`开发测试窗口启动失败：${error.message}`);
+  } finally {
+    devStartInstanceBtn.disabled = false;
+  }
+}
+
+async function startDevAutoBootTest() {
+  devStartTestBtn.disabled = true;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!tab?.id) {
+      alert('找不到当前活动标签页');
+      return;
+    }
+    const response = await chrome.runtime.sendMessage({
+      type: 'DEV_START_EC2_AUTO_BOOT_TEST',
+      tabId: tab.id
+    });
+    if (!response?.success) {
+      alert(response?.error || '无法启动 EC2 预填测试；请确认当前页面是 EC2 Quotas');
+    } else {
+      await chrome.storage.local.set({ devAutoBootTestTabId: tab.id });
+      alert('已跳转 EC2 启动配置页，扩展将预填并点击 Launch 真实启动实例；完成后点击 stoptest 返回 Quotas（窗口保留）。');
+    }
+  } catch (error) {
+    alert(`启动测试失败：${error.message}`);
+  } finally {
+    devStartTestBtn.disabled = false;
+  }
+}
+
+async function stopDevAutoBootTest() {
+  devStopTestBtn.disabled = true;
+  try {
+    const { devAutoBootTestTabId } = await chrome.storage.local.get('devAutoBootTestTabId');
+    const response = await chrome.runtime.sendMessage({
+      type: 'DEV_STOP_EC2_AUTO_BOOT_TEST',
+      tabId: devAutoBootTestTabId
+    });
+    if (!response?.success) {
+      alert(response?.error || '停止测试失败');
+      return;
+    }
+    await chrome.storage.local.remove(['devAutoBootTestTabId', 'devAutoBootTestPrefillStarted']);
+    updateDevTestButtons({ prefillStarted: false });
+  } catch (error) {
+    alert(`停止测试失败：${error.message}`);
+  } finally {
+    devStopTestBtn.disabled = false;
+  }
+}
+
+function updateDevTestButtons({ prefillStarted }) {
+  devStartInstanceBtn.style.display = '';
+  devStartTestBtn.style.display = prefillStarted ? 'none' : '';
+  devStopTestBtn.style.display = prefillStarted ? '' : 'none';
 }
 
 /**
@@ -766,6 +850,10 @@ async function init() {
     chrome.runtime.onMessage.addListener((message) => {
       if (message.type === 'STATE_UPDATE') {
         updateUI(message.state);
+        if (message.state?.devTestStatus === 'settled') {
+          updateDevTestButtons({ prefillStarted: true });
+          chrome.storage.local.set({ devAutoBootTestPrefillStarted: true });
+        }
       }
     });
   } catch (error) {
@@ -774,6 +862,41 @@ async function init() {
 
   // 绑定按钮事件
   startBtn.addEventListener('click', startRegistration);
+  devStartInstanceBtn.addEventListener('click', startDevInstanceWindow);
+  devStartTestBtn.addEventListener('click', startDevAutoBootTest);
+  devStopTestBtn.addEventListener('click', stopDevAutoBootTest);
+  const devState = await chrome.storage.local.get([
+    'devAutoBootTestWindowId',
+    'devAutoBootTestTabId',
+    'devAutoBootTestPrefillStarted'
+  ]);
+  if (devState.devAutoBootTestWindowId) {
+    try {
+      await chrome.windows.get(devState.devAutoBootTestWindowId);
+    } catch {
+      await chrome.storage.local.remove('devAutoBootTestWindowId');
+    }
+  }
+  let devTabOpen = false;
+  if (devState.devAutoBootTestTabId) {
+    try {
+      await chrome.tabs.get(devState.devAutoBootTestTabId);
+      devTabOpen = true;
+    } catch {
+      await chrome.storage.local.remove(['devAutoBootTestTabId', 'devAutoBootTestPrefillStarted']);
+    }
+  }
+  let devTestSettled = false;
+  try {
+    const { state } = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
+    devTestSettled = state?.devTestStatus === 'settled';
+  } catch (error) {
+    console.error('[Popup] 无法获取开发测试状态:', error);
+  }
+  if (devTestSettled) await chrome.storage.local.set({ devAutoBootTestPrefillStarted: true });
+  updateDevTestButtons({
+    prefillStarted: devTestSettled || (devTabOpen && Boolean(devState.devAutoBootTestPrefillStarted))
+  });
   stopBtn.addEventListener('click', stopRegistration);
   resetBtn.addEventListener('click', reset);
   exportBtn.addEventListener('click', exportHistory);

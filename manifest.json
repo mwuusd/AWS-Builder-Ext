@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AWS Auto Registration",
-  "version": "1.0.37",
+  "version": "1.0.45",
   "description": "AWS Builder 账号自动注册工具",
   "permissions": [
     "activeTab",

